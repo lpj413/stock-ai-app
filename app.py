@@ -43,54 +43,55 @@ analyze_btn = st.button("執行深度戰略分析", type="primary")
 if analyze_btn:
     config = STRATEGY_MAP.get(target, {"adr": "^IXIC", "index": "^SOX", "name": "一般個股"})
     
-    with st.spinner('正在進行寬容數據對齊與 AI 計算...'):
+    with st.spinner('正在統一時區並計算 AI 邏輯...'):
         try:
             # A. 數據抓取
             tk = yf.Ticker(target)
-            # 抓取較長的時間範圍以確保對齊成功
             hist = tk.history(period="2y", auto_adjust=False)
             adj_hist = tk.history(period="2y", auto_adjust=True)
             
             if hist.empty:
-                st.error("找不到該代號數據，請確認格式。")
+                st.error("找不到該代號數據。")
                 st.stop()
 
-            # B. 取得即時市場價 (鎖定 27.45)
+            # B. 取得即時市場價
             try:
                 live_price = float(tk.fast_info['last_price'])
             except:
                 live_price = float(hist['Close'].iloc[-1])
 
-            # C. 下載美股連動 (使用較短期間加速下載)
+            # C. 下載美股連動
             df_adr = yf.download(config['adr'], period="2y", auto_adjust=True, progress=False)['Close']
             df_idx = yf.download(config['index'], period="2y", auto_adjust=True, progress=False)['Close']
 
-            # D. 寬容對齊邏輯 (修正對齊量不足問題)
+            # D. 時區抹除與強制對齊 (解決 Cannot compare dtypes 錯誤)
+            # 將所有索引統一轉為「不帶時區的日期」
+            hist.index = hist.index.tz_localize(None)
+            adj_hist.index = adj_hist.index.tz_localize(None)
+            df_adr.index = df_adr.index.tz_localize(None)
+            df_idx.index = df_idx.index.tz_localize(None)
+
             # 建立主表
             main_df = pd.DataFrame(index=hist.index)
             main_df['TW_Raw'] = hist['Close']
             main_df['TW_Adj'] = adj_hist['Close']
             
-            # 合併美股數據
-            # 使用 reindex 配合 ffill 確保美股數據能對齊台股日期
+            # 使用 reindex 對齊美股數據
             main_df['ADR'] = df_adr.reindex(main_df.index, method='ffill')
             main_df['IDX'] = df_idx.reindex(main_df.index, method='ffill')
 
-            # 清洗：只要台股有價格就留下，美股沒開盤就拿前一天的補
+            # 清洗
             df = main_df.dropna(subset=['TW_Raw']).ffill().dropna()
 
-            if len(df) < 60: # 降低門檻，只要有三個月數據就執行
-                st.error("歷史數據交集過短，請稍後重試。")
-                st.stop()
-
-            # E. 數值校準
+            # E. 數值校準 (確保顯示 27.45)
             curr_raw = live_price if live_price > 0 else float(df['TW_Raw'].iloc[-1])
             curr_adj = float(df['TW_Adj'].iloc[-1])
             
-            # 若 Raw 已經反映今日 27.45 但 Adj 還沒，手動維持還原比例
-            if abs(curr_raw - df['TW_Raw'].iloc[-1]) > 0.01:
-                p_ratio = df['TW_Raw'].iloc[-2] / df['TW_Adj'].iloc[-2] # 拿前一日比例
-                curr_adj = curr_raw / p_ratio
+            # 處理除息跳空：若最新價格已更新但歷史 Adj 沒跟上，手動計算比例
+            if abs(curr_raw - df['TW_Raw'].iloc[-1]) > 0.05:
+                # 拿倒數第二筆(確定穩定的數據)計算掛牌/還原比例
+                stable_ratio = df['TW_Raw'].iloc[-2] / df['TW_Adj'].iloc[-2]
+                curr_adj = curr_raw / stable_ratio
 
             # F. 技術指標
             ma5 = df['TW_Adj'].rolling(5).mean().iloc[-1]
@@ -123,17 +124,17 @@ if analyze_btn:
             is_long_bull = ma5 > ma20 > ma60
             
             if is_long_bull and prob_up > 0.55:
-                st.success(f"✅【強力推薦】{config['name']} 趨勢強勁。")
-                advice = "路況極佳，分批加碼。漲到天花板可適度減碼。"
+                st.success(f"✅【強力推薦】趨勢極佳。")
+                advice = "分批加碼。漲到天花板可適度減碼。"
             elif is_long_bull:
-                st.warning(f"⏳【長多短空】{config['name']} 趨勢未壞，短線有壓。")
-                advice = "不用急著賣，但現在不適合追高，等跌回地板價。"
+                st.warning(f"⏳【長多短空】趨勢未壞，短線有壓。")
+                advice = "不用急著賣，等跌回地板價再買。"
             elif prob_up > 0.55:
-                st.info(f"⚡【短線反彈】{config['name']} 僅為短線反彈。")
+                st.info(f"⚡【短線反彈】目前僅為反彈。")
                 advice = "賺了就跑，不要長抱。"
             else:
-                st.error(f"❌【避開風險】{config['name']} 長短線皆弱。")
-                advice = "建議握緊現金，觀察地板價。"
+                st.error(f"❌【避開風險】長短線皆弱。")
+                advice = "握緊現金，觀察地板價。"
 
             c1, c2, c3 = st.columns(3)
             c1.metric(price_label, f"{curr_raw:.2f}")
@@ -142,13 +143,13 @@ if analyze_btn:
 
             st.write("### 🚩 實戰區間 (市場掛牌價)")
             col_a, col_b = st.columns(2)
-            col_a.info(f"📍 **建議下單(地板)：{lower_band:.2f}**")
-            col_b.error(f"📍 **建議獲利(天花板)：{upper_band:.2f}**")
+            col_a.info(f"📍 **建議撿貨價(地板)：{lower_band:.2f}**")
+            col_b.error(f"📍 **建議獲利價(天花板)：{upper_band:.2f}**")
 
             with st.expander("🔍 數據診斷"):
-                st.write(f"市場價: {curr_raw:.2f} / 還原價: {curr_adj:.2f}")
-                st.write(f"累積價差: {curr_raw - curr_adj:.2f}")
-                st.markdown(f"**操作建議：**\n{advice}")
+                st.write(f"當前掛牌價: {curr_raw:.2f}")
+                st.write(f"當前還原價: {curr_adj:.2f}")
+                st.markdown(f"**詳細建議：**\n{advice}")
 
         except Exception as e:
-            st.error(f"分析失敗，這可能是 Yahoo 數據源尚未結算完成。請 1 分鐘後重試。({e})")
+            st.error(f"分析失敗，這可能是時區對齊問題。請按按鈕重試。({e})")
