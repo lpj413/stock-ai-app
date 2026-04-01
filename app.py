@@ -1,13 +1,14 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from datetime import datetime
+import pytz
 
-# A. 網頁頁面設定 (手機優化)
-st.set_page_config(page_title="AI 股市導航", page_icon="📈")
+# 1. 網頁頁面優化設定
+st.set_page_config(page_title="AI 股市戰略導航儀", page_icon="📈", layout="centered")
 
-# B. 股票對照表
+# 2. 定義連動標的
 STRATEGY_MAP = {
     "2330.TW": {"adr": "TSM", "index": "^SOX", "name": "台積電"},
     "2317.TW": {"adr": "AAPL", "index": "^IXIC", "name": "鴻海"},
@@ -16,19 +17,25 @@ STRATEGY_MAP = {
     "3711.TW": {"adr": "ASX", "index": "^SOX", "name": "日月光"},
 }
 
-# C. 網頁標題與輸入
+# 3. 標題與時間顯示
 st.title("🍎 股市投資小幫手")
-st.subheader("AI 全方位戰略分析 (行動版)")
+st.subheader("AI 全方位戰略分析系統")
 
-target = st.text_input("輸入台股代號", value="2330.TW").upper().strip()
-analyze_btn = st.button("開始執行戰略分析", type="primary")
+# 設定台灣時區顯示時間
+tw_tz = pytz.timezone('Asia/Taipei')
+now_tw = datetime.now(tw_tz).strftime('%Y-%m-%d %H:%M:%S')
+st.caption(f"📅 系統偵測時間：{now_tw} (台北)")
+
+# 用戶輸入區
+target = st.text_input("輸入台股代號 (例如: 2330.TW)", value="2330.TW").upper().strip()
+analyze_btn = st.button("執行深度戰略分析", type="primary")
 
 if analyze_btn:
-    config = STRATEGY_MAP.get(target, {"adr": "^IXIC", "index": "^SOX", "name": "一般股票"})
+    config = STRATEGY_MAP.get(target, {"adr": "^IXIC", "index": "^SOX", "name": "一般個股"})
     
-    with st.spinner('正在同步全球數據...'):
+    with st.spinner('正在同步全球數據並校正預測模型...'):
         try:
-            # 1. 抓取數據
+            # A. 下載歷史數據 (3年以確保均線準確)
             df_all = yf.download(target, period="3y", progress=False)['Close']
             us_adr = yf.download(config['adr'], period="3y", progress=False)['Close']
             us_idx = yf.download(config['index'], period="3y", progress=False)['Close']
@@ -37,56 +44,79 @@ if analyze_btn:
             df.columns = ['TW', 'ADR', 'IDX']
             df = df.ffill().dropna()
 
-            # 2. 計算指標
+            # B. 技術指標計算
+            curr_price = df['TW'].iloc[-1]
             ma5 = df['TW'].rolling(5).mean().iloc[-1]
             ma20 = df['TW'].rolling(20).mean().iloc[-1]
             ma60 = df['TW'].rolling(60).mean().iloc[-1]
             std20 = df['TW'].rolling(20).std().iloc[-1]
             
-            upper_band = ma20 + (2 * std20)
-            lower_band = ma20 - (2 * std20)
-            curr = df['TW'].iloc[-1]
+            upper_band = ma20 + (2 * std20) # 天花板
+            lower_band = ma20 - (2 * std20) # 地板價
 
-            # 3. AI 預測
+            # C. AI 特徵工程 (使用變動率百分比)
             df['ADR_Ret'] = df['ADR'].pct_change().shift(1)
             df['IDX_Ret'] = df['IDX'].pct_change().shift(1)
-            df['Target'] = (df['TW'].shift(-1) > df['TW']).astype(int)
+            df['Target_Cls'] = (df['TW'].shift(-1) > df['TW']).astype(int)
+            df['Target_Pct'] = df['TW'].pct_change().shift(-1)
+            
             final_df = df.dropna()
             X = final_df[['ADR_Ret', 'IDX_Ret']]
-            clf = RandomForestClassifier(n_estimators=100, random_state=42).fit(X[:-1], final_df['Target'][:-1])
-            prob = clf.predict_proba(X.tail(1))[0][1]
+            
+            # --- AI 訓練與預測 ---
+            # 1. 預測信心度
+            clf = RandomForestClassifier(n_estimators=100, random_state=42).fit(X[:-1], final_df['Target_Cls'][:-1])
+            prob_up = clf.predict_proba(X.tail(1))[0][1]
+            prob_down = clf.predict_proba(X.tail(1))[0][0]
+            
+            # 2. 預測具體價格
+            regr = RandomForestRegressor(n_estimators=100, random_state=42).fit(X[:-1], final_df['Target_Pct'][:-1])
+            pred_pct = regr.predict(X.tail(1))[0]
+            pred_price = curr_price * (1 + pred_pct)
 
-            # 4. 顯示結果 (使用網頁排版)
+            # D. 介面呈現
             st.divider()
             
-            # 戰略顏色判定
+            # 決定狀態與長短期建議
             is_long_bull = ma5 > ma20 > ma60
-            is_short_bull = prob > 0.55
+            is_strong_up = prob_up > 0.55
             
-            if is_long_bull and is_short_bull:
-                st.success("✅【推薦買入】趨勢強勁且還有上漲空間。")
-            elif is_long_bull:
-                st.warning("⏳【建議觀望】長線沒壞，但明天可能回檔。")
-            elif is_short_bull:
-                st.info("⚡【短線價差】只是小反彈，不要長抱。")
+            # 核心建議顯示
+            if is_long_bull and is_strong_up:
+                st.success("✅【強力推薦】長線趨勢強勁，短線 AI 看好，適合順風買進。")
+                advice_msg = "目前路況極佳，建議分批加碼。若漲到天花板可適度減碼。"
+            elif is_long_bull and not is_strong_up:
+                st.warning("⏳【長多短空】長線趨勢未壞，但短線 AI 偵測到回檔壓力。")
+                advice_msg = "不用急著賣出長線部位，但現在不適合追高，等跌回地板價再買。"
+            elif not is_long_bull and is_strong_up:
+                st.info("⚡【短線反彈】長線仍在塞車，但短線有小機率反彈。")
+                advice_msg = "這只是小天晴，賺了就跑，千萬不要長抱，這不是翻轉趨勢。"
             else:
-                st.error("❌【暫不進場】目前路況不佳，風險較高。")
+                st.error("❌【避開風險】長線下行中，且短線 AI 極度看空。")
+                advice_msg = "路況極差，現在進場容易套牢，請握緊現金觀察地板價支撐。"
 
-            # 數據卡片
-            col1, col2 = st.columns(2)
-            col1.metric("目前價格", f"{curr:.2f}")
-            col2.metric("明日上漲信心", f"{prob*100:.0f}%")
+            # 主要數據卡片
+            c1, c2, c3 = st.columns(3)
+            c1.metric("今日收盤", f"{curr_price:.2f}")
+            
+            trend_icon = "📈" if prob_up > prob_down else "📉"
+            final_prob = prob_up if prob_up > prob_down else prob_down
+            c2.metric(f"AI 預測明日 {trend_icon}", f"{pred_price:.2f}", f"{pred_pct*100:+.2f}%")
+            c3.metric("預測信心度", f"{final_prob*100:.0f}%")
 
-            # 交易區間
-            st.write("### 🚩 買賣門票區間")
-            st.info(f"📍 **地板價（適合撿）：{lower_band:.2f} 元**")
-            st.error(f"📍 **天花板（記得賣）：{upper_band:.2f} 元**")
+            # 買賣區間提示
+            st.write("### 🚩 實戰買賣價格參考")
+            col_a, col_b = st.columns(2)
+            col_a.info(f"📍 **建議撿貨價 (地板)：{lower_band:.2f}**")
+            col_b.error(f"📍 **建議獲利價 (天花板)：{upper_band:.2f}**")
 
-            # 詳細細節
-            with st.expander("查看完整診斷報告"):
-                st.write(f"**長線趨勢：** {'🌟 多頭排列' if is_long_bull else '⚠️ 正在塞車'}")
-                st.write(f"**市場氣氛：** {'大家都在賺錢' if curr > ma60 else '大家都在賠錢'}")
-                st.write(f"**操作提醒：** 接近 {upper_band:.1f} 元時記得獲利了結。")
+            # 詳細診斷報告
+            with st.expander("🔍 深度戰略報告 (長短線整合)"):
+                st.write(f"**標的名稱：** {config['name']} ({target})")
+                st.write(f"**長線體質：** {'🌟 多頭排列 (高速公路)' if is_long_bull else '⚠️ 走勢偏弱 (慢速車道)'}")
+                st.write(f"**短線天氣：** {'☀️ AI 預報陽光普照' if is_strong_up else '🌧️ AI 預報可能有雨'}")
+                st.markdown(f"**💡 具體戰術建議：**\n{advice_msg}")
+                st.caption("註：分析結果於美股收盤後（台北時間早上 7 點）參考價值最高。")
 
         except Exception as e:
-            st.error(f"分析失敗：{e}")
+            st.error(f"發生錯誤！請檢查代號是否正確。錯誤訊息：{e}")
