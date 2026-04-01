@@ -5,111 +5,113 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from datetime import datetime
 import pytz
 
-# 1. 網頁頁面優化設定
-st.set_page_config(page_title="AI 股市戰略導航儀", page_icon="📈", layout="centered")
+# 1. 網頁頁面設定
+st.set_page_config(page_title="AI 雙價金戰略導航", page_icon="📈", layout="centered")
 
-# 2. 定義連動標的
 STRATEGY_MAP = {
     "2330.TW": {"adr": "TSM", "index": "^SOX", "name": "台積電"},
     "2317.TW": {"adr": "AAPL", "index": "^IXIC", "name": "鴻海"},
     "2454.TW": {"adr": "NVDA", "index": "^SOX", "name": "聯發科"},
     "2303.TW": {"adr": "UMC", "index": "^SOX", "name": "聯電"},
     "3711.TW": {"adr": "ASX", "index": "^SOX", "name": "日月光"},
+    "2324.TW": {"adr": "HPQ", "index": "^IXIC", "name": "仁寶"}, # 增加仁寶對照組
 }
 
-# 3. 標題與時間顯示
 st.title("🍎 股市投資小幫手")
-st.subheader("AI 全方位戰略分析系統 (修正版)")
+st.subheader("AI 雙價位戰略分析 (掛牌價 + 還原價)")
 
 tw_tz = pytz.timezone('Asia/Taipei')
 now_tw = datetime.now(tw_tz).strftime('%Y-%m-%d %H:%M:%S')
 st.caption(f"📅 系統偵測時間：{now_tw} (台北)")
 
-target = st.text_input("輸入台股代號 (例如: 2330.TW)", value="2330.TW").upper().strip()
+target = st.text_input("輸入台股代號 (例如: 2324.TW)", value="2330.TW").upper().strip()
 analyze_btn = st.button("執行深度戰略分析", type="primary")
 
 if analyze_btn:
     config = STRATEGY_MAP.get(target, {"adr": "^IXIC", "index": "^SOX", "name": "一般個股"})
     
-    with st.spinner('正在從全球資料庫同步數據...'):
+    with st.spinner('正在同步全球雙軌數據...'):
         try:
-            # A. 數據抓取：修正 'Adj Close' 抓取邏輯
-            # 使用 auto_adjust=True 讓 Close 直接就是調整後收盤價
-            df_tw = yf.download(target, period="2y", interval="1d", auto_adjust=True, progress=False)['Close']
-            df_adr = yf.download(config['adr'], period="2y", interval="1d", auto_adjust=True, progress=False)['Close']
-            df_idx = yf.download(config['index'], period="2y", interval="1d", auto_adjust=True, progress=False)['Close']
-
-            # 合併數據
-            df = pd.concat([df_tw, df_adr, df_idx], axis=1)
-            df.columns = ['TW', 'ADR', 'IDX']
+            # A. 抓取數據：同時抓取「掛牌價」與「還原價」
+            raw_data = yf.download(target, period="2y", auto_adjust=False, progress=False)
+            adj_data = yf.download(target, period="2y", auto_adjust=True, progress=False)
             
-            # 數據清洗：確保台股有開盤的日期
-            df = df.dropna(subset=['TW'])
-            df = df.ffill().dropna()
+            # 美股連動數據 (維持還原價以利 AI 學習趨勢)
+            df_adr = yf.download(config['adr'], period="2y", auto_adjust=True, progress=False)['Close']
+            df_idx = yf.download(config['index'], period="2y", auto_adjust=True, progress=False)['Close']
 
-            # B. 技術指標計算
-            curr_price = float(df['TW'].iloc[-1])
-            ma5 = df['TW'].rolling(5).mean().iloc[-1]
-            ma20 = df['TW'].rolling(20).mean().iloc[-1]
-            ma60 = df['TW'].rolling(60).mean().iloc[-1]
-            std20 = df['TW'].rolling(20).std().iloc[-1]
+            # 建立合併表格
+            df = pd.DataFrame({
+                'TW_Raw': raw_data['Close'],   # 市場掛牌價 (27.45)
+                'TW_Adj': adj_data['Close'],   # 還原股價 (26.95)
+                'ADR': df_adr,
+                'IDX': df_idx
+            })
+
+            df = df.dropna(subset=['TW_Raw']).ffill().dropna()
+
+            # B. 取得最新數值
+            curr_raw = float(df['TW_Raw'].iloc[-1])
+            curr_adj = float(df['TW_Adj'].iloc[-1])
             
-            upper_band = ma20 + (2 * std20)
-            lower_band = ma20 - (2 * std20)
+            # C. 技術指標與 AI (使用還原價計算，避免除息缺口干擾)
+            ma5 = df['TW_Adj'].rolling(5).mean().iloc[-1]
+            ma20 = df['TW_Adj'].rolling(20).mean().iloc[-1]
+            ma60 = df['TW_Adj'].rolling(60).mean().iloc[-1]
+            std20 = df['TW_Adj'].rolling(20).std().iloc[-1]
+            
+            # 轉換回掛牌價比例的地板與天花板 (方便下單)
+            ratio = curr_raw / curr_adj
+            upper_band = (ma20 + (2 * std20)) * ratio
+            lower_band = (ma20 - (2 * std20)) * ratio
 
-            # C. AI 特徵工程
+            # D. AI 訓練 (使用還原百分比)
             df['ADR_Ret'] = df['ADR'].pct_change().shift(1)
             df['IDX_Ret'] = df['IDX'].pct_change().shift(1)
-            df['Target_Pct'] = df['TW'].pct_change().shift(-1)
-            df['Target_Cls'] = (df['TW'].shift(-1) > df['TW']).astype(int)
+            df['Target_Pct'] = df['TW_Adj'].pct_change().shift(-1)
+            df['Target_Cls'] = (df['TW_Adj'].shift(-1) > df['TW_Adj']).astype(int)
             
             final_df = df.dropna()
             X = final_df[['ADR_Ret', 'IDX_Ret']]
             
-            # --- AI 訓練 ---
             clf = RandomForestClassifier(n_estimators=100, random_state=42).fit(X[:-1], final_df['Target_Cls'][:-1])
             prob_up = clf.predict_proba(X.tail(1))[0][1]
-            prob_down = clf.predict_proba(X.tail(1))[0][0]
             
             regr = RandomForestRegressor(n_estimators=100, random_state=42).fit(X[:-1], final_df['Target_Pct'][:-1])
             pred_pct = float(regr.predict(X.tail(1))[0])
-            pred_price = curr_price * (1 + pred_pct)
+            pred_price_raw = curr_raw * (1 + pred_pct) # 以掛牌價顯示預測結果
 
-            # D. 介面呈現
+            # E. 介面呈現
             st.divider()
+            
+            # 戰略判斷
             is_long_bull = ma5 > ma20 > ma60
-            is_strong_up = prob_up > 0.55
-            
-            if is_long_bull and is_strong_up:
-                st.success("✅【強力推薦】長線趨勢強勁，短線 AI 看好。")
-                advice_msg = "目前路況極佳，建議分批加碼。若漲到天花板可適度減碼。"
-            elif is_long_bull and not is_strong_up:
-                st.warning("⏳【長多短空】趨勢未壞，但短線有回檔壓力。")
-                advice_msg = "不用急著賣出，但現在不適合追高，等跌回地板價再買。"
-            elif not is_long_bull and is_strong_up:
-                st.info("⚡【短線反彈】長線走勢偏弱，目前僅為短暫反彈。")
-                advice_msg = "這只是短暫天晴，賺了就跑，千萬不要長抱。"
+            if is_long_bull:
+                st.success(f"✅【強力推薦】{config['name']} 長線趨勢強勁。")
             else:
-                st.error("❌【避開風險】長線下行中，且短線 AI 看空。")
-                advice_msg = "目前路況極差，建議握緊現金觀察地板價支撐。"
+                st.error(f"❌【避開風險】{config['name']} 目前走勢偏弱。")
 
+            # 核心數據卡片
             c1, c2, c3 = st.columns(3)
-            c1.metric("今日收盤價", f"{curr_price:.2f}")
+            # 今日收盤：主顯示掛牌價，副顯示還原價
+            c1.metric("市場掛牌價", f"{curr_raw:.2f}")
+            st.sidebar.write(f"💡 還原參考價: {curr_adj:.2f}") # 放在側邊或小字
             
-            trend_icon = "📈" if prob_up > prob_down else "📉"
-            final_prob = prob_up if prob_up > prob_down else prob_down
-            c2.metric(f"AI 預估明天 {trend_icon}", f"{pred_price:.2f}", f"{pred_pct*100:+.2f}%")
-            c3.metric("方向信心度", f"{final_prob*100:.0f}%")
+            trend_icon = "📈" if prob_up > 0.5 else "📉"
+            c2.metric(f"明日預測 (掛牌)", f"{pred_price_raw:.2f}", f"{pred_pct*100:+.2f}%")
+            c3.metric("方向信心度", f"{max(prob_up, 1-prob_up)*100:.0f}%")
 
-            st.write("### 🚩 實戰買賣價格參考")
+            # 買賣區間 (直接給掛牌價，方便下單)
+            st.write("### 🚩 實戰下單價格參考 (掛牌價)")
             col_a, col_b = st.columns(2)
-            col_a.info(f"📍 **建議撿貨價 (地板)：{lower_band:.2f}**")
+            col_a.info(f"📍 **分批撿貨價 (地板)：{lower_band:.2f}**")
             col_b.error(f"📍 **建議獲利價 (天花板)：{upper_band:.2f}**")
 
-            with st.expander("🔍 檢視詳細診斷報告"):
-                st.write(f"**標的名稱：** {config['name']} ({target})")
-                st.write(f"**長線體質：** {'🌟 多頭排列' if is_long_bull else '⚠️ 走勢偏弱'}")
-                st.markdown(f"**💡 戰術操作：**\n{advice_msg}")
+            with st.expander("🔍 查看還原價與技術細節"):
+                st.write(f"**今日市場價：** {curr_raw:.2f}")
+                st.write(f"**今日還原價：** {curr_adj:.2f}")
+                st.write(f"**兩者價差：** {curr_raw - curr_adj:.2f} (包含已領取股利/權利)")
+                st.caption("AI 運算時會自動考慮除權息缺口，確保預測不失真。")
 
         except Exception as e:
-            st.error(f"分析發生錯誤，這通常是數據暫時讀取失敗。請稍後再試一次。錯誤：{e}")
+            st.error(f"分析發生錯誤：{e}")
